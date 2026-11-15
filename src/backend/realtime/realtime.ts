@@ -91,7 +91,7 @@ function upsample16to24 (input: Buffer): Buffer {
 }
 
 /** Фраза из одного слова вызова: человек сказал «Яндекс» и сделал паузу перед вопросом */
-const WAKE_WORD_ONLY = /^\s*(яндекс|алиса)[\s.,!?…-]*$/i
+const WAKE_WORD_ONLY = /^\s*((яндекс|алиса)[\s.,!?…-]*)?$/i // пустая фраза (шум, эхо) — тоже не вопрос
 
 export type RealtimeEvent = { type: string } & Record<string, unknown>
 
@@ -122,6 +122,9 @@ export class RealtimeDialog {
 
   private readonly continuous: boolean
   private tokenTimer: NodeJS.Timeout | null = null
+  /** Ответ создаём сами: только когда OpenAI уже получил список инструментов MCP */
+  private toolsReady = true
+  private createWhenReady = false
 
   constructor (settings: RealtimeSettings) {
     this.continuous = settings.continuous ?? false
@@ -131,6 +134,7 @@ export class RealtimeDialog {
     this.ready = new Promise((resolve, reject) => {
       this.ws.once('open', async () => {
         const tools = await this.mcpTools(settings)
+        this.toolsReady = tools.length === 0
         if (tools.length > 0) {
           // access-токен живёт 5 минут: в долгом разговоре обновляем инструменты с новым токеном
           this.tokenTimer = setInterval(async () => {
@@ -147,8 +151,8 @@ export class RealtimeDialog {
                 format: { rate: 24_000, type: 'audio/pcm' },
                 transcription: { language: 'ru', model: settings.transcriptionModel },
                 turn_detection: settings.turnDetection === 'semantic'
-                  ? { create_response: true, eagerness: settings.eagerness, interrupt_response: this.continuous, type: 'semantic_vad' }
-                  : { create_response: true, interrupt_response: this.continuous, silence_duration_ms: settings.silenceMs, type: 'server_vad' }
+                  ? { create_response: false, eagerness: settings.eagerness, interrupt_response: this.continuous, type: 'semantic_vad' }
+                  : { create_response: false, interrupt_response: this.continuous, silence_duration_ms: settings.silenceMs, type: 'server_vad' }
               },
               output: {
                 format: { rate: 24_000, type: 'audio/pcm' },
@@ -223,6 +227,16 @@ export class RealtimeDialog {
     this.endOfUtterance = callback
   }
 
+  /** Ответ на фразу: сразу, если инструменты готовы, иначе — когда OpenAI их получит */
+  private createResponse (): void {
+    if (this.toolsReady) {
+      this.send({ type: 'response.create' })
+    } else {
+      this.logger.info('Realtime: waiting for MCP tools before answering')
+      this.createWhenReady = true
+    }
+  }
+
   /** Фраза настоящая: отдаём придержанный звук, станции — конец высказывания */
   private accept (): void {
     this.verdict = 'pass'
@@ -266,6 +280,7 @@ export class RealtimeDialog {
         this.responseDone = false
         this.assistantText = ''
         this.firstAudioLogged = false
+        this.createResponse()
         // Без расшифровки не знаем, не одно ли это «Яндекс»; не пришла за 2 с — отвечаем как есть
         setTimeout(() => {
           if (this.verdict === 'pending') this.accept()
@@ -283,6 +298,7 @@ export class RealtimeDialog {
           this.onEvent?.({ type: 'wake-only' })
           this.verdict = 'drop'
           this.held = []
+          this.createWhenReady = false
           this.send({ type: 'response.cancel' })
           break
         }
@@ -347,6 +363,11 @@ export class RealtimeDialog {
       }
       case 'mcp_list_tools.completed': {
         this.logger.info('Realtime MCP tools listed')
+        this.toolsReady = true
+        if (this.createWhenReady) {
+          this.createWhenReady = false
+          this.send({ type: 'response.create' })
+        }
         break
       }
       case 'response.mcp_call.completed':
