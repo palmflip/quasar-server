@@ -125,6 +125,9 @@ export class RealtimeDialog {
   /** Ответ создаём сами: только когда OpenAI уже получил список инструментов MCP */
   private toolsReady = true
   private createWhenReady = false
+  /** OpenAI держит один активный ответ: новый ставим в очередь до response.done */
+  private responseActive = false
+  private createQueued = false
 
   constructor (settings: RealtimeSettings) {
     this.continuous = settings.continuous ?? false
@@ -227,10 +230,19 @@ export class RealtimeDialog {
     this.endOfUtterance = callback
   }
 
+  private requestResponse (): void {
+    if (this.responseActive) {
+      this.createQueued = true
+      return
+    }
+    this.responseActive = true
+    this.send({ type: 'response.create' })
+  }
+
   /** Ответ на фразу: сразу, если инструменты готовы, иначе — когда OpenAI их получит */
   private createResponse (): void {
     if (this.toolsReady) {
-      this.send({ type: 'response.create' })
+      this.requestResponse()
     } else {
       this.logger.info('Realtime: waiting for MCP tools before answering')
       this.createWhenReady = true
@@ -267,6 +279,9 @@ export class RealtimeDialog {
         if (this.continuous) {
           // Человек заговорил: сервер сам отменяет ответ (interrupt_response), клиент глушит звук
           this.onEvent?.({ type: 'speech-started' })
+          if (this.responseActive) this.send({ type: 'response.cancel' })
+          this.awaitingTool = false
+          this.createQueued = false
           this.verdict = 'idle'
           this.held = []
         }
@@ -326,7 +341,16 @@ export class RealtimeDialog {
         this.assistantText += String(event['delta'] ?? '')
         break
       }
+      case 'response.created': {
+        this.responseActive = true
+        break
+      }
       case 'response.done': {
+        this.responseActive = false
+        if (this.createQueued) {
+          this.createQueued = false
+          this.requestResponse()
+        }
         const output = (event['response'] as { output?: { type: string }[] } | undefined)?.output ?? []
         if (this.verdict !== 'drop' && output.some(item => item.type === 'mcp_call')) {
           // «Сейчас гляну» + вызов bannie: поток не закрываем, ответ с данными будет следующим
@@ -366,7 +390,7 @@ export class RealtimeDialog {
         this.toolsReady = true
         if (this.createWhenReady) {
           this.createWhenReady = false
-          this.send({ type: 'response.create' })
+          this.requestResponse()
         }
         break
       }
@@ -376,11 +400,16 @@ export class RealtimeDialog {
         this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, name: (event['item'] as { name?: string } | undefined)?.name, type: String(event['type']) })
         if (this.awaitingTool) {
           this.awaitingTool = false
-          this.send({ type: 'response.create' })
+          this.requestResponse()
         }
         break
       }
       case 'error': {
+        if ((event['error'] as { code?: string } | undefined)?.code === 'conversation_already_has_active_response') {
+          this.createQueued = true
+          break
+        }
+        if ((event['error'] as { code?: string } | undefined)?.code === 'response_cancel_not_active') break
         this.logger.error(`Realtime error: ${JSON.stringify(event['error'])}`)
         this.onEvent?.({ error: event['error'], type: 'error' })
         this.emitEndOfUtterance()
