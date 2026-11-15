@@ -126,6 +126,7 @@ const uniProxyRouter = registerUniproxyAliceYandexNetRouter({
   }), {
     model: environment.TTS_OPENAI_MODEL,
     speed: environment.TTS_OPENAI_SPEED,
+    streamFormat: environment.TTS_OPENAI_STREAM_FORMAT,
     voice: environment.TTS_OPENAI_VOICE
   })
 }, server)

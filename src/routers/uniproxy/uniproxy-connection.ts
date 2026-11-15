@@ -1211,7 +1211,7 @@ export class UniProxyConnection {
                 StreamId: streamId
               },
               TtsSpeak: {
-                Format: 'audio/opus',
+                Format: this.parameters.tts.streamMime ?? 'audio/opus',
                 LazyTtsStreaming: false,
               }
             },

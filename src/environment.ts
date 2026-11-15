@@ -31,6 +31,8 @@ const environmentType = z.intersection(z.object({
   TTS_OPENAI_BASE_URL: z.url().default('http://10.0.3.137:8000'),
   TTS_OPENAI_MODEL: z.string().default(''),
 
+  /** Формат потокового синтеза: opus (страницы Ogg) или pcm (16 бит, 24 кГц, моно — быстрее первый звук) */
+  TTS_OPENAI_STREAM_FORMAT: z.enum(['opus', 'pcm']).default('opus'),
   TTS_OPENAI_SPEED: z.string().default('1').transform(Number),
 
   TTS_OPENAI_VOICE: z.string().default('IVONA 2 Tatyana OEM'),
