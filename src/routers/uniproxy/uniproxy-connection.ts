@@ -1079,6 +1079,21 @@ export class UniProxyConnection {
         })
       }
 
+      if (result.text !== '' && this.parameters.tts.synthesizeStream) {
+        try {
+          await this.sendTTSStream(this.parameters.tts.synthesizeStream({
+            parentSpan: span ?? this.inputSpan ?? this.dialogSpan,
+            text: result.text
+          }), referenceMessageId)
+        } catch (error) {
+          this.logger.error('Failed to stream TTS: ', error)
+          this.closeConnection()
+        } finally {
+          span?.end()
+        }
+        return
+      }
+
       let audioData: Buffer = Buffer.from([])
       try {
         if (result.text !== '') {
@@ -1174,6 +1189,54 @@ export class UniProxyConnection {
       },
       Timings: this.getTimings()
     })
+  }
+
+  /** Заголовок TtsSpeak сразу, затем страницы звука по мере синтеза, затем Close */
+  private async sendTTSStream (pages: AsyncIterable<Buffer>, referenceMessageId: string): Promise<void> {
+    this.lastOutputAudioStreamId++
+    const streamId = this.lastOutputAudioStreamId
+    const started = Date.now()
+    let first = true
+    let total = 0
+    try {
+      for await (const page of pages) {
+        if (first) {
+          first = false
+          this.logger.info(`TTS first audio after ${Date.now() - started} ms`)
+          await this.sendServerMessage({
+            Event: {
+              Header: {
+                MessageId: randomUUID(),
+                RefMessageId: referenceMessageId,
+                StreamId: streamId
+              },
+              TtsSpeak: {
+                Format: 'audio/opus',
+                LazyTtsStreaming: false,
+              }
+            },
+            Timings: this.getTimings()
+          })
+        }
+        total += page.length
+        await this.sendAudioDataMessage(streamId, page)
+      }
+    } finally {
+      if (!first) {
+        await this.sendServerMessage({
+          StreamControl: {
+            Close: {},
+            MessageId: randomUUID(),
+            StreamId: streamId
+          },
+          Timings: this.getTimings()
+        })
+      }
+      this.logger.info(`TTS streamed ${total} bytes in ${Date.now() - started} ms`)
+    }
+    if (first) {
+      await this.sendTTS(Buffer.from([]), referenceMessageId)
+    }
   }
 
   private setupVoiceInputHandlers (): void {

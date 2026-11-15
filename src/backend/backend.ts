@@ -53,6 +53,8 @@ export interface STTChunkTranscribeResult {
 
 export interface TTSBackend {
   synthesize(request: TTSRequest): Promise<TTSResponse>;
+  /** Звук по мере синтеза (целые страницы Ogg Opus). Нет метода — станция ждёт весь ответ */
+  synthesizeStream?(request: TTSRequest): AsyncIterable<Buffer>;
 }
 
 export interface TTSRequest {
