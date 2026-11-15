@@ -89,8 +89,12 @@ function upsample16to24 (input: Buffer): Buffer {
 /** Фраза из одного слова вызова: человек сказал «Яндекс» и сделал паузу перед вопросом */
 const WAKE_WORD_ONLY = /^\s*(яндекс|алиса)[\s.,!?…-]*$/i
 
+export type RealtimeEvent = { type: string } & Record<string, unknown>
+
 export class RealtimeDialog {
   private static pending: RealtimeDialog | null = null
+  /** Наблюдатель за ходом диалога (демо-страница) */
+  onEvent: ((event: RealtimeEvent) => void) | null = null
   assistantText = ''
   /** Ответ уже идёт: при закрытии распознавания соединение не рвём */
   responding = false
@@ -201,6 +205,7 @@ export class RealtimeDialog {
     this.emitEndOfUtterance()
     if (this.responseDone) {
       this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
+      this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, text: this.assistantText, type: 'assistant' })
       this.audioChannel.close()
     }
   }
@@ -233,10 +238,12 @@ export class RealtimeDialog {
       case 'conversation.item.input_audio_transcription.completed': {
         const text = String(event['transcript'] ?? '').trim()
         this.logger.info(`Realtime user: ${text}`)
+        this.onEvent?.({ text, type: 'user' })
         if (this.verdict !== 'pending') break
         if (WAKE_WORD_ONLY.test(text)) {
           // Только «Яндекс» — отменяем ответ и слушаем дальше, вопрос ещё впереди
           this.logger.info('Realtime: only the wake word, waiting for the question')
+          this.onEvent?.({ type: 'wake-only' })
           this.verdict = 'drop'
           this.held = []
           this.send({ type: 'response.cancel' })
@@ -251,6 +258,7 @@ export class RealtimeDialog {
         if (!this.firstAudioLogged) {
           this.firstAudioLogged = true
           this.logger.info(`Realtime first audio ${Date.now() - this.speechStoppedAt} ms after end of speech`)
+          this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, type: 'first-audio' })
         }
         const audio = Buffer.from(String(event['delta']), 'base64')
         if (this.verdict === 'pending') {
@@ -283,6 +291,7 @@ export class RealtimeDialog {
           break
         }
         this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
+        this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, text: this.assistantText, type: 'assistant' })
         this.audioChannel.close()
         break
       }
@@ -293,6 +302,7 @@ export class RealtimeDialog {
       case 'response.mcp_call.completed':
       case 'response.mcp_call.failed': {
         this.logger.info(`Realtime ${String(event['type'])} after ${Date.now() - this.speechStoppedAt} ms`)
+        this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, name: (event['item'] as { name?: string } | undefined)?.name, type: String(event['type']) })
         if (this.awaitingTool) {
           this.awaitingTool = false
           this.send({ type: 'response.create' })
@@ -301,6 +311,7 @@ export class RealtimeDialog {
       }
       case 'error': {
         this.logger.error(`Realtime error: ${JSON.stringify(event['error'])}`)
+        this.onEvent?.({ error: event['error'], type: 'error' })
         this.emitEndOfUtterance()
         this.audioChannel.close()
         break
@@ -335,15 +346,18 @@ class RealtimeSTTSession extends STTBackendSession {
   }
 }
 
-export class RealtimeSTTBackend implements STTBackend {
-  private readonly settings: RealtimeSettings
+export type RealtimeBackendSettings = Omit<RealtimeSettings, 'instructions'> & { instructionsPath: string }
 
-  constructor (settings: Omit<RealtimeSettings, 'instructions'> & { instructionsPath: string }) {
-    const { instructionsPath, ...rest } = settings
-    this.settings = { ...rest, instructions: fs.readFileSync(instructionsPath, 'utf8') }
+export class RealtimeSTTBackend implements STTBackend {
+  constructor (private readonly settings: RealtimeBackendSettings) {}
+
+  /** Новый диалог; инструкции перечитываются каждый раз — правки файла применяются без перезапуска */
+  createDialog (): RealtimeDialog {
+    const { instructionsPath, ...rest } = this.settings
+    return new RealtimeDialog({ ...rest, instructions: fs.readFileSync(instructionsPath, 'utf8') })
   }
 
   async startTranscribing (_span?: Span): Promise<STTBackendSession> {
-    return new RealtimeSTTSession(new RealtimeDialog(this.settings))
+    return new RealtimeSTTSession(this.createDialog())
   }
 }

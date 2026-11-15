@@ -27,6 +27,8 @@ const environmentType = z.intersection(z.object({
 
   SENTRY_DSN: z.url().default('https://test@o0.ingest.sentry.io/0'),
   /** gpt-realtime вместо распознавания + processor + синтеза (эксперимент, см. backend/realtime) */
+  /** Демо-страница «колонка в браузере»; 0 — выключена */
+  DEMO_PORT: z.string().default('31117').transform(Number),
   REALTIME_MODE: z.string().default('false').transform(value => value.toLowerCase().trim() === 'true'),
   REALTIME_API_KEY: z.string().default(''),
   REALTIME_MCP_TOKEN_URL: z.string().default(''),

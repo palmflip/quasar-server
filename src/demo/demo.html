@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Колонка в браузере</title>
+<style>
+  :root { --bg: #f6f5f2; --card: #fff; --ink: #1d1d1b; --muted: #77746d; --accent: #d9480f; --user: #e8f0fe; --bot: #fff4e6; --line: #e4e1da; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161513; --card: #1f1e1b; --ink: #f1efe9; --muted: #9b978e; --accent: #ff8a4c; --user: #1d2a3f; --bot: #33261a; --line: #2e2c28; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.45 -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tabs button { flex: 1; padding: 10px; border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 10px; font: inherit; cursor: pointer; }
+  .tabs button.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .hidden { display: none; }
+  .mic { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 12px 0 4px; }
+  .mic button { width: 120px; height: 120px; border-radius: 50%; border: none; background: var(--accent); color: #fff; font: 600 15px/1.2 inherit; cursor: pointer; box-shadow: 0 6px 20px rgb(0 0 0 / 15%); }
+  .mic button.live { animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { transform: scale(1.06); } }
+  .status { color: var(--muted); font-size: 14px; min-height: 20px; text-align: center; }
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+  .row button { padding: 0 18px; border-radius: 10px; border: none; background: var(--accent); color: #fff; font: 600 15px inherit; cursor: pointer; }
+  .log { margin-top: 18px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { padding: 10px 12px; border-radius: 12px; max-width: 92%; white-space: pre-wrap; }
+  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.bot { background: var(--bot); align-self: flex-start; }
+  .meta { color: var(--muted); font-size: 12.5px; align-self: center; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Колонка в браузере</h1>
+  <p class="sub">Тот же бэкенд, что у колонки, только вместо неё микрофон и динамик Мака.</p>
+  <div class="tabs">
+    <button id="tab-rt" class="on">Realtime (голос)</button>
+    <button id="tab-tx">Processor (текст)</button>
+  </div>
+
+  <section id="pane-rt" class="card">
+    <div class="mic">
+      <button id="talk">Нажми<br>и говори</button>
+      <div class="status" id="rt-status">Начни с «Яндекс, …» — как с колонкой</div>
+    </div>
+    <div class="log" id="rt-log"></div>
+    <p class="hint">Конец фразы определяет сервер OpenAI по паузе. Инструкции — <code>realtime-instructions.txt</code>, перечитываются на каждый вопрос.</p>
+  </section>
+
+  <section id="pane-tx" class="card hidden">
+    <div class="row">
+      <input id="text" placeholder="Например: что у нас завтра по броням?" autocomplete="off">
+      <button id="send">Спросить</button>
+    </div>
+    <div class="log" id="tx-log"></div>
+    <p class="hint">Идёт через processor: промпт <code>prompt.handlebars</code>, память 10 минут, MCP bannie, синтез как у колонки.</p>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id)
+function add (log, cls, text) { const el = document.createElement('div'); el.className = cls; el.textContent = text; $(log).append(el); el.scrollIntoView({ block: 'end' }); return el }
+
+for (const [tab, pane] of [['tab-rt', 'pane-rt'], ['tab-tx', 'pane-tx']]) {
+  $(tab).onclick = () => {
+    for (const id of ['tab-rt', 'tab-tx']) $(id).classList.toggle('on', id === tab)
+    for (const id of ['pane-rt', 'pane-tx']) $(id).classList.toggle('hidden', id !== pane)
+  }
+}
+
+// ---------- realtime ----------
+const WORKLET = `class Down extends AudioWorkletProcessor {
+  constructor () { super(); this.buf = []; this.pos = 0 }
+  process (inputs) {
+    const ch = inputs[0][0]; if (!ch) return true
+    const ratio = sampleRate / 16000
+    for (; this.pos < ch.length; this.pos += ratio) this.buf.push(ch[Math.floor(this.pos)])
+    this.pos -= ch.length
+    if (this.buf.length >= 320) {
+      const out = new Int16Array(this.buf.length)
+      for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, this.buf[i])) * 0x7fff
+      this.port.postMessage(out.buffer, [out.buffer]); this.buf = []
+    }
+    return true
+  }
+}
+registerProcessor('down', Down)`
+
+let ctx, ws, live = false, playAt = 0, botEl = null, startedAt = 0
+async function ensureAudio () {
+  if (ctx) return
+  ctx = new AudioContext()
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' })))
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } })
+  const node = new AudioWorkletNode(ctx, 'down')
+  ctx.createMediaStreamSource(stream).connect(node)
+  node.port.onmessage = e => { if (live && ws?.readyState === 1) ws.send(e.data) }
+}
+function play (buffer) {
+  const pcm = new Int16Array(buffer); const f = new Float32Array(pcm.length)
+  for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 0x8000
+  const b = ctx.createBuffer(1, f.length, 24000); b.copyToChannel(f, 0)
+  const src = ctx.createBufferSource(); src.buffer = b; src.connect(ctx.destination)
+  playAt = Math.max(playAt, ctx.currentTime); src.start(playAt); playAt += b.duration
+}
+function connect () {
+  return new Promise(resolve => {
+    if (ws && ws.readyState === 1) return resolve()
+    ws = new WebSocket(`ws://${location.host}/realtime`); ws.binaryType = 'arraybuffer'
+    ws.onopen = resolve
+    ws.onmessage = e => {
+      if (typeof e.data !== 'string') { live = false; $('talk').classList.remove('live'); play(e.data); return }
+      const ev = JSON.parse(e.data)
+      if (ev.type === 'listening') $('rt-status').textContent = 'Слушаю…'
+      if (ev.type === 'user') add('rt-log', 'msg user', ev.text)
+      if (ev.type === 'wake-only') $('rt-status').textContent = 'Услышала «Яндекс», жду вопрос…'
+      if (ev.type === 'first-audio') add('rt-log', 'meta', `первый звук через ${ev.ms} мс после конца фразы`)
+      if (ev.type.startsWith('response.mcp_call')) add('rt-log', 'meta', `bannie${ev.name ? ' · ' + ev.name : ''} — ${ev.type.endsWith('failed') ? 'ошибка' : 'готово'} (${ev.ms} мс)`)
+      if (ev.type === 'assistant') { add('rt-log', 'msg bot', ev.text); add('rt-log', 'meta', `ответ целиком за ${ev.ms} мс`) }
+      if (ev.type === 'error') add('rt-log', 'meta', 'ошибка: ' + JSON.stringify(ev.error))
+      if (ev.type === 'done') { live = false; $('talk').classList.remove('live'); $('rt-status').textContent = 'Готово. Нажми, чтобы спросить ещё' }
+    }
+  })
+}
+$('talk').onclick = async () => {
+  await ensureAudio(); await ctx.resume(); await connect()
+  if (live) { live = false; ws.send(JSON.stringify({ type: 'stop' })); $('talk').classList.remove('live'); $('rt-status').textContent = 'Остановлено'; return }
+  live = true; $('talk').classList.add('live'); playAt = 0
+  ws.send(JSON.stringify({ type: 'start' }))
+}
+
+// ---------- processor ----------
+let tws
+function textSocket () {
+  return new Promise(resolve => {
+    if (tws && tws.readyState === 1) return resolve()
+    tws = new WebSocket(`ws://${location.host}/text`); tws.binaryType = 'arraybuffer'
+    tws.onopen = resolve
+    tws.onmessage = e => {
+      if (typeof e.data !== 'string') { new Audio(URL.createObjectURL(new Blob([e.data], { type: 'audio/ogg' }))).play(); return }
+      const ev = JSON.parse(e.data)
+      if (ev.type === 'answer') { for (const p of ev.parts) add('tx-log', 'msg bot', p); add('tx-log', 'meta', `processor: ${ev.ms} мс`) }
+      if (ev.type === 'tts') add('tx-log', 'meta', `синтез: ${ev.ms} мс`)
+      if (ev.type === 'error') add('tx-log', 'meta', 'ошибка: ' + ev.error)
+    }
+  })
+}
+async function send () {
+  const text = $('text').value.trim(); if (!text) return
+  $('text').value = ''; add('tx-log', 'msg user', text)
+  await textSocket(); tws.send(JSON.stringify({ text }))
+}
+$('send').onclick = send
+$('text').onkeydown = e => { if (e.key === 'Enter') send() }
+</script>
+</body>
+</html>

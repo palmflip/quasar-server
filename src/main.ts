@@ -13,6 +13,7 @@ import { BasicMusicBackend } from './backend/music/basic'
 import { StubMusicBackend } from './backend/music/stub'
 import { BasicProcessorBackend } from './backend/processors/basic'
 import { RealtimeSTTBackend } from './backend/realtime/realtime'
+import { startDemoServer } from './demo/demo-server'
 import { GigaAMSTTBackend } from './backend/stt/gigaam'
 import { OpenAITTSBackend } from './backend/tts/openai'
 import { getEnvironment } from './environment'
@@ -114,34 +115,43 @@ const server = app.listen(environment.PORT, error => {
   logger.info(`Started quasar on :${environment.PORT}`)
 })
 
+const realtimeBackend = new RealtimeSTTBackend({
+  apiKey: environment.REALTIME_API_KEY || environment.TTS_OPENAI_API_KEY || '',
+  eagerness: environment.REALTIME_EAGERNESS,
+  instructionsPath: environment.REALTIME_INSTRUCTIONS_PATH,
+  mcpTokenUrl: environment.REALTIME_MCP_TOKEN_URL,
+  model: environment.REALTIME_MODEL,
+  silenceMs: environment.REALTIME_SILENCE_MS,
+  transcriptionModel: environment.REALTIME_TRANSCRIPTION_MODEL,
+  turnDetection: environment.REALTIME_TURN_DETECTION,
+  voice: environment.REALTIME_VOICE
+})
+const ttsBackend = new OpenAITTSBackend(new OpenAI({
+  apiKey: environment.TTS_OPENAI_API_KEY,
+  baseURL: environment.TTS_OPENAI_BASE_URL
+}), {
+  model: environment.TTS_OPENAI_MODEL,
+  speed: environment.TTS_OPENAI_SPEED,
+  streamFormat: environment.TTS_OPENAI_STREAM_FORMAT,
+  voice: environment.TTS_OPENAI_VOICE
+})
+if (environment.DEMO_PORT > 0) {
+  startDemoServer({
+    port: environment.DEMO_PORT,
+    processorUrl: environment.PROCESSOR_BASIC_URL,
+    realtime: realtimeBackend,
+    tts: ttsBackend
+  })
+}
+
 const uniProxyRouter = registerUniproxyAliceYandexNetRouter({
   audioMetadata: new BufferedAudioMetadataBackend(environment.AUDIO_METADATA_URLS),
   music: musicBackend,
   musicManager: new MusicManager(musicBackend),
   processor: new BasicProcessorBackend(environment.PROCESSOR_BASIC_URL),
   storage,
-  stt: environment.REALTIME_MODE
-    ? new RealtimeSTTBackend({
-      apiKey: environment.REALTIME_API_KEY || environment.TTS_OPENAI_API_KEY || '',
-      instructionsPath: environment.REALTIME_INSTRUCTIONS_PATH,
-      mcpTokenUrl: environment.REALTIME_MCP_TOKEN_URL,
-      model: environment.REALTIME_MODEL,
-      eagerness: environment.REALTIME_EAGERNESS,
-      silenceMs: environment.REALTIME_SILENCE_MS,
-      turnDetection: environment.REALTIME_TURN_DETECTION,
-      transcriptionModel: environment.REALTIME_TRANSCRIPTION_MODEL,
-      voice: environment.REALTIME_VOICE
-    })
-    : new GigaAMSTTBackend(environment.STT_GIGAAM_URL),
-  tts: new OpenAITTSBackend(new OpenAI({
-    apiKey: environment.TTS_OPENAI_API_KEY,
-    baseURL: environment.TTS_OPENAI_BASE_URL
-  }), {
-    model: environment.TTS_OPENAI_MODEL,
-    speed: environment.TTS_OPENAI_SPEED,
-    streamFormat: environment.TTS_OPENAI_STREAM_FORMAT,
-    voice: environment.TTS_OPENAI_VOICE
-  })
+  stt: environment.REALTIME_MODE ? realtimeBackend : new GigaAMSTTBackend(environment.STT_GIGAAM_URL),
+  tts: ttsBackend
 }, server)
 
 app.use((request, response) => {
