@@ -124,6 +124,7 @@ const uniProxyRouter = registerUniproxyAliceYandexNetRouter({
     ? new RealtimeSTTBackend({
       apiKey: environment.REALTIME_API_KEY || environment.TTS_OPENAI_API_KEY || '',
       instructionsPath: environment.REALTIME_INSTRUCTIONS_PATH,
+      mcpTokenUrl: environment.REALTIME_MCP_TOKEN_URL,
       model: environment.REALTIME_MODEL,
       eagerness: environment.REALTIME_EAGERNESS,
       silenceMs: environment.REALTIME_SILENCE_MS,

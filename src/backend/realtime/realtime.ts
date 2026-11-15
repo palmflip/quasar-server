@@ -17,6 +17,8 @@ import { STTBackend, STTBackendSession } from '../backend'
 export interface RealtimeSettings {
   apiKey: string
   instructions: string
+  /** Внутренняя ручка processor с токеном MCP (пусто — без инструментов): http://processor:8080/internal/mcp-token/bannie */
+  mcpTokenUrl: string
   model: string
   silenceMs: number
   /** semantic — конец фразы по смыслу (пауза после «Яндекс» не обрывает), server — по тишине silenceMs */
@@ -100,6 +102,8 @@ export class RealtimeDialog {
   /** Звук ответа до проверки расшифровки: если фраза — одно слово вызова, ответ отменяем */
   private held: Buffer[] = []
   private responseDone = false
+  /** Ответ закончился вызовом MCP: после его завершения просим продолжение с данными */
+  private awaitingTool = false
   private verdict: 'drop' | 'idle' | 'pass' | 'pending' = 'idle'
   private readonly logger = getLogger<RealtimeDialog>()
   private readonly ready: Promise<void>
@@ -111,7 +115,8 @@ export class RealtimeDialog {
       headers: { Authorization: `Bearer ${settings.apiKey}` }
     })
     this.ready = new Promise((resolve, reject) => {
-      this.ws.once('open', () => {
+      this.ws.once('open', async () => {
+        const tools = await this.mcpTools(settings)
         this.send({
           session: {
             audio: {
@@ -129,6 +134,7 @@ export class RealtimeDialog {
             },
             instructions: settings.instructions,
             output_modalities: ['audio'],
+            tools,
             type: 'realtime'
           },
           type: 'session.update'
@@ -139,6 +145,21 @@ export class RealtimeDialog {
     })
     this.ws.on('message', data => this.handle(JSON.parse(data.toString()) as Record<string, unknown>))
     this.ws.on('close', () => this.audioChannel.close())
+  }
+
+  /** MCP-сервер (bannie) прямо в сессии: инструменты вызывает OpenAI, токен берём у processor */
+  private async mcpTools (settings: RealtimeSettings): Promise<object[]> {
+    if (!settings.mcpTokenUrl) return []
+    try {
+      const response = await fetch(settings.mcpTokenUrl)
+      const { access_token: token, url } = await response.json() as { access_token: string | null, url: string }
+      if (!token) return []
+      const label = new URL(settings.mcpTokenUrl).pathname.split('/').pop() ?? 'mcp'
+      return [{ authorization: token, require_approval: 'never', server_label: label, server_url: url, type: 'mcp' }]
+    } catch (error) {
+      this.logger.warn(`Realtime: no MCP token, tools disabled: ${error}`)
+      return []
+    }
   }
 
   /** Диалог, у которого закончилась фраза и идёт ответ: его забирает uniproxy-connection */
@@ -191,6 +212,9 @@ export class RealtimeDialog {
   }
 
   private handle (event: Record<string, unknown>): void {
+    if (process.env['REALTIME_DEBUG'] && !String(event['type']).includes('delta')) {
+      this.logger.info(`RT event ${String(event['type'])}${event['type'] === 'response.done' ? ' ' + JSON.stringify((event['response'] as { output?: { type: string }[] })?.output?.map(item => item.type)) : ''}`)
+    }
     switch (event['type']) {
       case 'input_audio_buffer.speech_stopped': {
         if (this.verdict === 'pass') break
@@ -242,6 +266,13 @@ export class RealtimeDialog {
         break
       }
       case 'response.done': {
+        const output = (event['response'] as { output?: { type: string }[] } | undefined)?.output ?? []
+        if (this.verdict !== 'drop' && output.some(item => item.type === 'mcp_call')) {
+          // «Сейчас гляну» + вызов bannie: поток не закрываем, ответ с данными будет следующим
+          this.awaitingTool = true
+          if (this.verdict === 'pending') this.responseDone = false
+          break
+        }
         if (this.verdict === 'drop') {
           this.verdict = 'idle'
           break
@@ -253,6 +284,19 @@ export class RealtimeDialog {
         }
         this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
         this.audioChannel.close()
+        break
+      }
+      case 'mcp_list_tools.completed': {
+        this.logger.info('Realtime MCP tools listed')
+        break
+      }
+      case 'response.mcp_call.completed':
+      case 'response.mcp_call.failed': {
+        this.logger.info(`Realtime ${String(event['type'])} after ${Date.now() - this.speechStoppedAt} ms`)
+        if (this.awaitingTool) {
+          this.awaitingTool = false
+          this.send({ type: 'response.create' })
+        }
         break
       }
       case 'error': {
