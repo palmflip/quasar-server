@@ -21,6 +21,8 @@ export interface RealtimeSettings {
   instructions: string
   /** Внутренняя ручка processor с токеном MCP (пусто — без инструментов): http://processor:8080/internal/mcp-token/bannie */
   mcpTokenUrl: string
+  /** Только эти инструменты MCP (пусто — все): модель не увидит лишних и не будет по ним ходить */
+  mcpAllowedTools: string[]
   model: string
   silenceMs: number
   /** semantic — конец фразы по смыслу (пауза после «Яндекс» не обрывает), server — по тишине silenceMs */
@@ -119,6 +121,7 @@ export class RealtimeDialog {
   private readonly ws: WebSocket
 
   private readonly continuous: boolean
+  private tokenTimer: NodeJS.Timeout | null = null
 
   constructor (settings: RealtimeSettings) {
     this.continuous = settings.continuous ?? false
@@ -128,6 +131,15 @@ export class RealtimeDialog {
     this.ready = new Promise((resolve, reject) => {
       this.ws.once('open', async () => {
         const tools = await this.mcpTools(settings)
+        if (tools.length > 0) {
+          // access-токен живёт 5 минут: в долгом разговоре обновляем инструменты с новым токеном
+          this.tokenTimer = setInterval(async () => {
+            const fresh = await this.mcpTools(settings)
+            if (fresh.length > 0 && this.ws.readyState === this.ws.OPEN) {
+              this.send({ session: { tools: fresh, type: 'realtime' }, type: 'session.update' })
+            }
+          }, 4 * 60 * 1000)
+        }
         this.send({
           session: {
             audio: {
@@ -166,7 +178,14 @@ export class RealtimeDialog {
       const { access_token: token, url } = await response.json() as { access_token: string | null, url: string }
       if (!token) return []
       const label = new URL(settings.mcpTokenUrl).pathname.split('/').pop() ?? 'mcp'
-      return [{ authorization: token, require_approval: 'never', server_label: label, server_url: url, type: 'mcp' }]
+      return [{
+        authorization: token,
+        require_approval: 'never',
+        server_label: label,
+        server_url: url,
+        type: 'mcp',
+        ...(settings.mcpAllowedTools.length > 0 ? { allowed_tools: settings.mcpAllowedTools } : {})
+      }]
     } catch (error) {
       this.logger.warn(`Realtime: no MCP token, tools disabled: ${error}`)
       return []
@@ -192,6 +211,7 @@ export class RealtimeDialog {
   }
 
   close (): void {
+    if (this.tokenTimer) clearInterval(this.tokenTimer)
     if (RealtimeDialog.active === this) RealtimeDialog.active = null
     this.audioChannel.close()
     if (this.ws.readyState === this.ws.OPEN || this.ws.readyState === this.ws.CONNECTING) {
@@ -314,6 +334,15 @@ export class RealtimeDialog {
           break
         }
         this.audioChannel.close()
+        break
+      }
+      case 'response.output_item.done': {
+        const item = event['item'] as { arguments?: string, error?: unknown, name?: string, output?: string, type?: string } | undefined
+        if (item?.type === 'mcp_call') {
+          const detail = item.error ? `ERROR ${JSON.stringify(item.error)}` : `ok, ${String(item.output ?? '').length} chars`
+          this.logger.info(`Realtime MCP ${item.name}(${item.arguments}) → ${detail}`)
+          this.onEvent?.({ arguments: item.arguments, error: item.error, name: item.name, type: 'mcp-detail' })
+        }
         break
       }
       case 'mcp_list_tools.completed': {

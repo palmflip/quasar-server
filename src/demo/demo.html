@@ -124,6 +124,7 @@ function connect () {
       if (ev.type.startsWith('response.mcp_call')) add('rt-log', 'meta', `bannie${ev.name ? ' · ' + ev.name : ''} — ${ev.type.endsWith('failed') ? 'ошибка' : 'готово'} (${ev.ms} мс)`)
       if (ev.type === 'assistant') { add('rt-log', 'msg bot', ev.text); add('rt-log', 'meta', `ответ целиком за ${ev.ms} мс`) }
       if (ev.type === 'error') add('rt-log', 'meta', 'ошибка: ' + JSON.stringify(ev.error))
+      if (ev.type === 'mcp-detail' && ev.error) add('rt-log', 'meta', `bannie ${ev.name}: ошибка ${JSON.stringify(ev.error).slice(0, 200)}`)
       if (ev.type === 'done') { live = false; $('talk').classList.remove('live'); $('rt-status').textContent = 'Готово. Нажми, чтобы спросить ещё' }
     }
   })

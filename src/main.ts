@@ -119,6 +119,7 @@ const realtimeBackend = new RealtimeSTTBackend({
   apiKey: environment.REALTIME_API_KEY || environment.TTS_OPENAI_API_KEY || '',
   eagerness: environment.REALTIME_EAGERNESS,
   instructionsPath: environment.REALTIME_INSTRUCTIONS_PATH,
+  mcpAllowedTools: environment.REALTIME_MCP_ALLOWED_TOOLS,
   mcpTokenUrl: environment.REALTIME_MCP_TOKEN_URL,
   model: environment.REALTIME_MODEL,
   silenceMs: environment.REALTIME_SILENCE_MS,

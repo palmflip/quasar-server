@@ -32,6 +32,7 @@ const environmentType = z.intersection(z.object({
   REALTIME_MODE: z.string().default('false').transform(value => value.toLowerCase().trim() === 'true'),
   REALTIME_API_KEY: z.string().default(''),
   REALTIME_MCP_TOKEN_URL: z.string().default(''),
+  REALTIME_MCP_ALLOWED_TOOLS: z.string().default('').transform(value => value.split(',').map(item => item.trim()).filter(Boolean)),
   REALTIME_MODEL: z.string().default('gpt-realtime-2.1-mini'),
   REALTIME_VOICE: z.string().default('marin'),
   REALTIME_INSTRUCTIONS_PATH: z.string().default('/realtime-instructions.txt'),
