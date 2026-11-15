@@ -26,6 +26,16 @@ const environmentType = z.intersection(z.object({
   PROCESSOR_BASIC_URL: z.url().default('http://localhost:8080'),
 
   SENTRY_DSN: z.url().default('https://test@o0.ingest.sentry.io/0'),
+  /** gpt-realtime вместо распознавания + processor + синтеза (эксперимент, см. backend/realtime) */
+  REALTIME_MODE: z.string().default('false').transform(value => value.toLowerCase().trim() === 'true'),
+  REALTIME_API_KEY: z.string().default(''),
+  REALTIME_MODEL: z.string().default('gpt-realtime-2.1-mini'),
+  REALTIME_VOICE: z.string().default('marin'),
+  REALTIME_INSTRUCTIONS_PATH: z.string().default('/realtime-instructions.txt'),
+  REALTIME_TURN_DETECTION: z.enum(['semantic', 'server']).default('server'),
+  REALTIME_EAGERNESS: z.enum(['auto', 'high', 'low', 'medium']).default('medium'),
+  REALTIME_SILENCE_MS: z.string().default('600').transform(Number),
+  REALTIME_TRANSCRIPTION_MODEL: z.string().default('gpt-4o-mini-transcribe'),
   STT_GIGAAM_URL: z.url().default('ws://10.0.3.137:8080'),
   TTS_OPENAI_API_KEY: z.string().default(''),
   TTS_OPENAI_BASE_URL: z.url().default('http://10.0.3.137:8000'),

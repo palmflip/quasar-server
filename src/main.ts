@@ -12,6 +12,7 @@ import { BufferedAudioMetadataBackend } from './backend/audio-metadata/buffered'
 import { BasicMusicBackend } from './backend/music/basic'
 import { StubMusicBackend } from './backend/music/stub'
 import { BasicProcessorBackend } from './backend/processors/basic'
+import { RealtimeSTTBackend } from './backend/realtime/realtime'
 import { GigaAMSTTBackend } from './backend/stt/gigaam'
 import { OpenAITTSBackend } from './backend/tts/openai'
 import { getEnvironment } from './environment'
@@ -119,7 +120,18 @@ const uniProxyRouter = registerUniproxyAliceYandexNetRouter({
   musicManager: new MusicManager(musicBackend),
   processor: new BasicProcessorBackend(environment.PROCESSOR_BASIC_URL),
   storage,
-  stt: new GigaAMSTTBackend(environment.STT_GIGAAM_URL),
+  stt: environment.REALTIME_MODE
+    ? new RealtimeSTTBackend({
+      apiKey: environment.REALTIME_API_KEY || environment.TTS_OPENAI_API_KEY || '',
+      instructionsPath: environment.REALTIME_INSTRUCTIONS_PATH,
+      model: environment.REALTIME_MODEL,
+      eagerness: environment.REALTIME_EAGERNESS,
+      silenceMs: environment.REALTIME_SILENCE_MS,
+      turnDetection: environment.REALTIME_TURN_DETECTION,
+      transcriptionModel: environment.REALTIME_TRANSCRIPTION_MODEL,
+      voice: environment.REALTIME_VOICE
+    })
+    : new GigaAMSTTBackend(environment.STT_GIGAAM_URL),
   tts: new OpenAITTSBackend(new OpenAI({
     apiKey: environment.TTS_OPENAI_API_KEY,
     baseURL: environment.TTS_OPENAI_BASE_URL

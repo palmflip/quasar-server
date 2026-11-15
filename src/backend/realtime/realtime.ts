@@ -1,0 +1,305 @@
+import fs from 'node:fs'
+
+import { Span } from '@sentry/node'
+import { WebSocket } from 'ws'
+
+import { OpusProcessor } from '../../codecs/opus-processor'
+import { getLogger } from '../../logger'
+import { STTBackend, STTBackendSession } from '../backend'
+
+/**
+ * Режим gpt-realtime (REALTIME_MODE=true): звук станции идёт прямо в OpenAI Realtime API,
+ * конец фразы определяет сервер OpenAI, ответ приходит звуком. Распознавание, processor и
+ * отдельный синтез не участвуют. Реализовано как STT-бэкенд: VoiceInputHandler получает от него
+ * текст фразы и конец высказывания, а ответный звук забирает uniproxy-connection через takePending.
+ */
+
+export interface RealtimeSettings {
+  apiKey: string
+  instructions: string
+  model: string
+  silenceMs: number
+  /** semantic — конец фразы по смыслу (пауза после «Яндекс» не обрывает), server — по тишине silenceMs */
+  turnDetection: 'semantic' | 'server'
+  /** Для semantic: low — дольше ждёт, high — отвечает раньше */
+  eagerness: 'auto' | 'high' | 'low' | 'medium'
+  transcriptionModel: string
+  voice: string
+}
+
+class Channel<T> {
+  private readonly items: T[] = []
+  private waiting: ((value: IteratorResult<T>) => void) | null = null
+  private closed = false
+
+  push (item: T): void {
+    if (this.closed) return
+    if (this.waiting) {
+      const resolve = this.waiting
+      this.waiting = null
+      resolve({ done: false, value: item })
+    } else {
+      this.items.push(item)
+    }
+  }
+
+  close (): void {
+    this.closed = true
+    if (this.waiting) {
+      const resolve = this.waiting
+      this.waiting = null
+      resolve({ done: true, value: undefined })
+    }
+  }
+
+  async * [Symbol.asyncIterator] (): AsyncGenerator<T> {
+    while (true) {
+      if (this.items.length > 0) {
+        yield this.items.shift()!
+        continue
+      }
+      if (this.closed) return
+      const next = await new Promise<IteratorResult<T>>(resolve => {
+        this.waiting = resolve
+      })
+      if (next.done) return
+      yield next.value
+    }
+  }
+}
+
+/** PCM16 моно 16 кГц → 24 кГц линейной интерполяцией (Realtime принимает PCM только 24 кГц) */
+function upsample16to24 (input: Buffer): Buffer {
+  const inSamples = Math.floor(input.length / 2)
+  const outSamples = Math.floor(inSamples * 3 / 2)
+  const output = Buffer.alloc(outSamples * 2)
+  for (let i = 0; i < outSamples; i++) {
+    const position = i * 2 / 3
+    const index = Math.floor(position)
+    const fraction = position - index
+    const a = input.readInt16LE(Math.min(index, inSamples - 1) * 2)
+    const b = input.readInt16LE(Math.min(index + 1, inSamples - 1) * 2)
+    output.writeInt16LE(Math.round(a + (b - a) * fraction), i * 2)
+  }
+  return output
+}
+
+/** Фраза из одного слова вызова: человек сказал «Яндекс» и сделал паузу перед вопросом */
+const WAKE_WORD_ONLY = /^\s*(яндекс|алиса)[\s.,!?…-]*$/i
+
+export class RealtimeDialog {
+  private static pending: RealtimeDialog | null = null
+  assistantText = ''
+  /** Ответ уже идёт: при закрытии распознавания соединение не рвём */
+  responding = false
+  userText = ''
+  private readonly audioChannel = new Channel<Buffer>()
+  private endOfUtterance: ((text: string) => void) | null = null
+  private eouSent = false
+  private firstAudioLogged = false
+  /** Звук ответа до проверки расшифровки: если фраза — одно слово вызова, ответ отменяем */
+  private held: Buffer[] = []
+  private responseDone = false
+  private verdict: 'drop' | 'idle' | 'pass' | 'pending' = 'idle'
+  private readonly logger = getLogger<RealtimeDialog>()
+  private readonly ready: Promise<void>
+  private speechStoppedAt = 0
+  private readonly ws: WebSocket
+
+  constructor (settings: RealtimeSettings) {
+    this.ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(settings.model)}`, {
+      headers: { Authorization: `Bearer ${settings.apiKey}` }
+    })
+    this.ready = new Promise((resolve, reject) => {
+      this.ws.once('open', () => {
+        this.send({
+          session: {
+            audio: {
+              input: {
+                format: { rate: 24_000, type: 'audio/pcm' },
+                transcription: { language: 'ru', model: settings.transcriptionModel },
+                turn_detection: settings.turnDetection === 'semantic'
+                  ? { create_response: true, eagerness: settings.eagerness, interrupt_response: false, type: 'semantic_vad' }
+                  : { create_response: true, interrupt_response: false, silence_duration_ms: settings.silenceMs, type: 'server_vad' }
+              },
+              output: {
+                format: { rate: 24_000, type: 'audio/pcm' },
+                voice: settings.voice
+              }
+            },
+            instructions: settings.instructions,
+            output_modalities: ['audio'],
+            type: 'realtime'
+          },
+          type: 'session.update'
+        })
+        resolve()
+      })
+      this.ws.once('error', reject)
+    })
+    this.ws.on('message', data => this.handle(JSON.parse(data.toString()) as Record<string, unknown>))
+    this.ws.on('close', () => this.audioChannel.close())
+  }
+
+  /** Диалог, у которого закончилась фраза и идёт ответ: его забирает uniproxy-connection */
+  static takePending (): RealtimeDialog | null {
+    const dialog = RealtimeDialog.pending
+    RealtimeDialog.pending = null
+    return dialog
+  }
+
+  async appendPcm16k (pcm: Buffer): Promise<void> {
+    await this.ready
+    if (this.ws.readyState !== this.ws.OPEN) return
+    this.send({ audio: upsample16to24(pcm).toString('base64'), type: 'input_audio_buffer.append' })
+  }
+
+  /** PCM16 24 кГц ответа по мере генерации */
+  audio (): AsyncIterable<Buffer> {
+    return this.audioChannel
+  }
+
+  close (): void {
+    this.audioChannel.close()
+    if (this.ws.readyState === this.ws.OPEN || this.ws.readyState === this.ws.CONNECTING) {
+      this.ws.close()
+    }
+  }
+
+  onEndOfUtterance (callback: (text: string) => void): void {
+    this.endOfUtterance = callback
+  }
+
+  /** Фраза настоящая: отдаём придержанный звук, станции — конец высказывания */
+  private accept (): void {
+    this.verdict = 'pass'
+    this.responding = true
+    RealtimeDialog.pending = this
+    for (const audio of this.held) this.audioChannel.push(audio)
+    this.held = []
+    this.emitEndOfUtterance()
+    if (this.responseDone) {
+      this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
+      this.audioChannel.close()
+    }
+  }
+
+  private emitEndOfUtterance (): void {
+    if (this.eouSent) return
+    this.eouSent = true
+    this.endOfUtterance?.(this.userText)
+  }
+
+  private handle (event: Record<string, unknown>): void {
+    switch (event['type']) {
+      case 'input_audio_buffer.speech_stopped': {
+        if (this.verdict === 'pass') break
+        this.speechStoppedAt = Date.now()
+        this.verdict = 'pending'
+        this.held = []
+        this.responseDone = false
+        this.assistantText = ''
+        this.firstAudioLogged = false
+        // Без расшифровки не знаем, не одно ли это «Яндекс»; не пришла за 2 с — отвечаем как есть
+        setTimeout(() => {
+          if (this.verdict === 'pending') this.accept()
+        }, 2000)
+        break
+      }
+      case 'conversation.item.input_audio_transcription.completed': {
+        const text = String(event['transcript'] ?? '').trim()
+        this.logger.info(`Realtime user: ${text}`)
+        if (this.verdict !== 'pending') break
+        if (WAKE_WORD_ONLY.test(text)) {
+          // Только «Яндекс» — отменяем ответ и слушаем дальше, вопрос ещё впереди
+          this.logger.info('Realtime: only the wake word, waiting for the question')
+          this.verdict = 'drop'
+          this.held = []
+          this.send({ type: 'response.cancel' })
+          break
+        }
+        this.userText = text
+        this.accept()
+        break
+      }
+      case 'response.output_audio.delta': {
+        if (this.verdict === 'drop' || this.verdict === 'idle') break
+        if (!this.firstAudioLogged) {
+          this.firstAudioLogged = true
+          this.logger.info(`Realtime first audio ${Date.now() - this.speechStoppedAt} ms after end of speech`)
+        }
+        const audio = Buffer.from(String(event['delta']), 'base64')
+        if (this.verdict === 'pending') {
+          this.held.push(audio)
+        } else {
+          this.audioChannel.push(audio)
+        }
+        break
+      }
+      case 'response.output_audio_transcript.delta': {
+        if (this.verdict === 'drop') break
+        this.assistantText += String(event['delta'] ?? '')
+        break
+      }
+      case 'response.done': {
+        if (this.verdict === 'drop') {
+          this.verdict = 'idle'
+          break
+        }
+        if (this.verdict === 'pending') {
+          // Ответ готов раньше расшифровки: ждём вердикт, звук придержан
+          this.responseDone = true
+          break
+        }
+        this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
+        this.audioChannel.close()
+        break
+      }
+      case 'error': {
+        this.logger.error(`Realtime error: ${JSON.stringify(event['error'])}`)
+        this.emitEndOfUtterance()
+        this.audioChannel.close()
+        break
+      }
+      default:
+    }
+  }
+
+  private send (event: object): void {
+    this.ws.send(JSON.stringify(event))
+  }
+}
+
+class RealtimeSTTSession extends STTBackendSession {
+  private readonly opus: OpusProcessor
+
+  constructor (private readonly dialog: RealtimeDialog) {
+    super()
+    this.opus = new OpusProcessor(pcm => dialog.appendPcm16k(pcm), async () => {})
+    dialog.onEndOfUtterance(text => this.chunkTranscribed({ endOfUtt: true, text }))
+  }
+
+  close (): void {
+    // После конца фразы соединение нужно для ответа: его закроет uniproxy-connection
+    if (!this.dialog.responding) {
+      this.dialog.close()
+    }
+  }
+
+  async transcribeChunk (chunk: Buffer): Promise<void> {
+    await this.opus.handleAudioData(chunk)
+  }
+}
+
+export class RealtimeSTTBackend implements STTBackend {
+  private readonly settings: RealtimeSettings
+
+  constructor (settings: Omit<RealtimeSettings, 'instructions'> & { instructionsPath: string }) {
+    const { instructionsPath, ...rest } = settings
+    this.settings = { ...rest, instructions: fs.readFileSync(instructionsPath, 'utf8') }
+  }
+
+  async startTranscribing (_span?: Span): Promise<STTBackendSession> {
+    return new RealtimeSTTSession(new RealtimeDialog(this.settings))
+  }
+}

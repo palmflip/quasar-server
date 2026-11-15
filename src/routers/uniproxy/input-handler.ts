@@ -63,8 +63,11 @@ export interface InputMetadataEntry {
 }
 
 export interface InputResult {
+  /** Готовый ответ звуком (Ogg Opus страницами) — режим gpt-realtime; синтез тогда не нужен */
+  audio?: AsyncIterable<Buffer>
   dialogFinished: boolean
   directives: WrappedDirective[]
+  onAudioDone?: () => void
   shouldListen: boolean
   text: null | string
 }

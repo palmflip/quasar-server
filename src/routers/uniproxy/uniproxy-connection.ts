@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto'
 import { RawData, WebSocket } from 'ws'
 
 import { AudioMetadataBackend, MusicBackend, ProcessorBackend, STTBackend, TTSBackend } from '../../backend/backend'
+import { RealtimeDialog } from '../../backend/realtime/realtime'
+import { pcmToOggOpus } from '../../codecs/ogg-opus-writer'
 import { getLogger } from '../../logger'
 import { MusicManager } from '../../music/manager'
 import { decodeProtobufStruct, getValue } from '../../protobuf'
@@ -1063,6 +1065,18 @@ export class UniProxyConnection {
       return
     }
 
+    if (result.audio) {
+      try {
+        await this.sendTTSStream(result.audio, referenceMessageId)
+      } catch (error) {
+        this.logger.error('Failed to stream realtime audio: ', error)
+        this.closeConnection()
+      } finally {
+        result.onAudioDone?.()
+      }
+      return
+    }
+
     if (result.text !== null) {
       this.logger.info(`Synthesizing: ${result.text}`)
 
@@ -1252,9 +1266,19 @@ export class UniProxyConnection {
       }
 
       let inputResult: InputResult
+      const realtime = RealtimeDialog.takePending()
       try {
         await this.inputHandlerOpenSessionPromise
-        inputResult = await this.inputHandler.processVoiceInput({
+        inputResult = realtime
+          ? {
+              audio: pcmToOggOpus(realtime.audio(), 24_000),
+              dialogFinished: true,
+              directives: [],
+              onAudioDone: () => realtime.close(),
+              shouldListen: false,
+              text: ''
+            }
+          : await this.inputHandler.processVoiceInput({
           metadata: event.metadata,
           text: event.text
         }, this.inputSpan ?? this.dialogSpan)
