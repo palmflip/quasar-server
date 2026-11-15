@@ -38,7 +38,7 @@ function realtimeSession (socket: WebSocket, realtime: RealtimeSTTBackend): void
     const message = JSON.parse(data.toString()) as { type: string }
     if (message.type === 'start') {
       dialog?.close()
-      const current = realtime.createDialog()
+      const current = realtime.createDialog({ continuous: true })
       dialog = current
       current.onEvent = event => sendJson(event)
       sendJson({ type: 'listening' })

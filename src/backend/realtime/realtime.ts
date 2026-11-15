@@ -16,6 +16,8 @@ import { STTBackend, STTBackendSession } from '../backend'
 
 export interface RealtimeSettings {
   apiKey: string
+  /** Непрерывный разговор с перебиванием (демо): микрофон открыт и во время ответа, речь человека глушит ответ */
+  continuous?: boolean
   instructions: string
   /** Внутренняя ручка processor с токеном MCP (пусто — без инструментов): http://processor:8080/internal/mcp-token/bannie */
   mcpTokenUrl: string
@@ -92,6 +94,8 @@ const WAKE_WORD_ONLY = /^\s*(яндекс|алиса)[\s.,!?…-]*$/i
 export type RealtimeEvent = { type: string } & Record<string, unknown>
 
 export class RealtimeDialog {
+  /** Диалог, чей ответ сейчас звучит на станции: новый вопрос его обрывает */
+  static active: RealtimeDialog | null = null
   private static pending: RealtimeDialog | null = null
   /** Наблюдатель за ходом диалога (демо-страница) */
   onEvent: ((event: RealtimeEvent) => void) | null = null
@@ -114,7 +118,10 @@ export class RealtimeDialog {
   private speechStoppedAt = 0
   private readonly ws: WebSocket
 
+  private readonly continuous: boolean
+
   constructor (settings: RealtimeSettings) {
+    this.continuous = settings.continuous ?? false
     this.ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(settings.model)}`, {
       headers: { Authorization: `Bearer ${settings.apiKey}` }
     })
@@ -128,8 +135,8 @@ export class RealtimeDialog {
                 format: { rate: 24_000, type: 'audio/pcm' },
                 transcription: { language: 'ru', model: settings.transcriptionModel },
                 turn_detection: settings.turnDetection === 'semantic'
-                  ? { create_response: true, eagerness: settings.eagerness, interrupt_response: false, type: 'semantic_vad' }
-                  : { create_response: true, interrupt_response: false, silence_duration_ms: settings.silenceMs, type: 'server_vad' }
+                  ? { create_response: true, eagerness: settings.eagerness, interrupt_response: this.continuous, type: 'semantic_vad' }
+                  : { create_response: true, interrupt_response: this.continuous, silence_duration_ms: settings.silenceMs, type: 'server_vad' }
               },
               output: {
                 format: { rate: 24_000, type: 'audio/pcm' },
@@ -185,6 +192,7 @@ export class RealtimeDialog {
   }
 
   close (): void {
+    if (RealtimeDialog.active === this) RealtimeDialog.active = null
     this.audioChannel.close()
     if (this.ws.readyState === this.ws.OPEN || this.ws.readyState === this.ws.CONNECTING) {
       this.ws.close()
@@ -221,8 +229,17 @@ export class RealtimeDialog {
       this.logger.info(`RT event ${String(event['type'])}${event['type'] === 'response.done' ? ' ' + JSON.stringify((event['response'] as { output?: { type: string }[] })?.output?.map(item => item.type)) : ''}`)
     }
     switch (event['type']) {
+      case 'input_audio_buffer.speech_started': {
+        if (this.continuous) {
+          // Человек заговорил: сервер сам отменяет ответ (interrupt_response), клиент глушит звук
+          this.onEvent?.({ type: 'speech-started' })
+          this.verdict = 'idle'
+          this.held = []
+        }
+        break
+      }
       case 'input_audio_buffer.speech_stopped': {
-        if (this.verdict === 'pass') break
+        if (this.verdict === 'pass' && !this.continuous) break
         this.speechStoppedAt = Date.now()
         this.verdict = 'pending'
         this.held = []
@@ -292,6 +309,10 @@ export class RealtimeDialog {
         }
         this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
         this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, text: this.assistantText, type: 'assistant' })
+        if (this.continuous) {
+          this.verdict = 'idle'
+          break
+        }
         this.audioChannel.close()
         break
       }
@@ -352,12 +373,16 @@ export class RealtimeSTTBackend implements STTBackend {
   constructor (private readonly settings: RealtimeBackendSettings) {}
 
   /** Новый диалог; инструкции перечитываются каждый раз — правки файла применяются без перезапуска */
-  createDialog (): RealtimeDialog {
+  createDialog (overrides: Partial<RealtimeSettings> = {}): RealtimeDialog {
     const { instructionsPath, ...rest } = this.settings
-    return new RealtimeDialog({ ...rest, instructions: fs.readFileSync(instructionsPath, 'utf8') })
+    return new RealtimeDialog({ ...rest, instructions: fs.readFileSync(instructionsPath, 'utf8'), ...overrides })
   }
 
   async startTranscribing (_span?: Span): Promise<STTBackendSession> {
-    return new RealtimeSTTSession(this.createDialog())
+    // Новый вопрос (в том числе «Яндекс» посреди ответа) обрывает звучащий ответ
+    RealtimeDialog.active?.close()
+    const dialog = this.createDialog()
+    RealtimeDialog.active = dialog
+    return new RealtimeSTTSession(dialog)
   }
 }

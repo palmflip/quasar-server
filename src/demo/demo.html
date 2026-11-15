@@ -48,7 +48,7 @@
       <div class="status" id="rt-status">Начни с «Яндекс, …» — как с колонкой</div>
     </div>
     <div class="log" id="rt-log"></div>
-    <p class="hint">Конец фразы определяет сервер OpenAI по паузе. Инструкции — <code>realtime-instructions.txt</code>, перечитываются на каждый вопрос.</p>
+    <p class="hint">Конец фразы определяет сервер OpenAI по паузе. Перебивать можно просто голосом — лучше в наушниках, иначе она услышит сама себя. Инструкции — <code>realtime-instructions.txt</code>, перечитываются на каждый вопрос.</p>
   </section>
 
   <section id="pane-tx" class="card hidden">
@@ -89,7 +89,7 @@ const WORKLET = `class Down extends AudioWorkletProcessor {
 }
 registerProcessor('down', Down)`
 
-let ctx, ws, live = false, playAt = 0, botEl = null, startedAt = 0
+let ctx, ws, live = false, playAt = 0, sources = []
 async function ensureAudio () {
   if (ctx) return
   ctx = new AudioContext()
@@ -105,16 +105,19 @@ function play (buffer) {
   const b = ctx.createBuffer(1, f.length, 24000); b.copyToChannel(f, 0)
   const src = ctx.createBufferSource(); src.buffer = b; src.connect(ctx.destination)
   playAt = Math.max(playAt, ctx.currentTime); src.start(playAt); playAt += b.duration
+  sources.push(src); src.onended = () => { sources = sources.filter(x => x !== src) }
 }
+function hush () { for (const s of sources) { try { s.stop() } catch {} } sources = []; playAt = 0 }
 function connect () {
   return new Promise(resolve => {
     if (ws && ws.readyState === 1) return resolve()
     ws = new WebSocket(`ws://${location.host}/realtime`); ws.binaryType = 'arraybuffer'
     ws.onopen = resolve
     ws.onmessage = e => {
-      if (typeof e.data !== 'string') { live = false; $('talk').classList.remove('live'); play(e.data); return }
+      if (typeof e.data !== 'string') { play(e.data); return }
       const ev = JSON.parse(e.data)
-      if (ev.type === 'listening') $('rt-status').textContent = 'Слушаю…'
+      if (ev.type === 'listening') $('rt-status').textContent = 'Разговор идёт — говори, перебивай. Нажми ещё раз, чтобы закончить'
+      if (ev.type === 'speech-started') { if (sources.length) add('rt-log', 'meta', '✋ перебил — ответ остановлен'); hush() }
       if (ev.type === 'user') add('rt-log', 'msg user', ev.text)
       if (ev.type === 'wake-only') $('rt-status').textContent = 'Услышала «Яндекс», жду вопрос…'
       if (ev.type === 'first-audio') add('rt-log', 'meta', `первый звук через ${ev.ms} мс после конца фразы`)
@@ -127,8 +130,8 @@ function connect () {
 }
 $('talk').onclick = async () => {
   await ensureAudio(); await ctx.resume(); await connect()
-  if (live) { live = false; ws.send(JSON.stringify({ type: 'stop' })); $('talk').classList.remove('live'); $('rt-status').textContent = 'Остановлено'; return }
-  live = true; $('talk').classList.add('live'); playAt = 0
+  if (live) { live = false; hush(); ws.send(JSON.stringify({ type: 'stop' })); $('talk').classList.remove('live'); $('talk').innerHTML = 'Нажми<br>и говори'; $('rt-status').textContent = 'Разговор закончен'; return }
+  live = true; $('talk').classList.add('live'); $('talk').innerHTML = 'Закончить<br>разговор'; hush()
   ws.send(JSON.stringify({ type: 'start' }))
 }
 
