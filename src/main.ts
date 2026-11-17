@@ -136,6 +136,9 @@ const ttsBackend = new OpenAITTSBackend(new OpenAI({
   streamFormat: environment.TTS_OPENAI_STREAM_FORMAT,
   voice: environment.TTS_OPENAI_VOICE
 })
+if (environment.REALTIME_MODE) {
+  realtimeBackend.startWarmPool()
+}
 if (environment.DEMO_PORT > 0) {
   startDemoServer({
     port: environment.DEMO_PORT,

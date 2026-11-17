@@ -107,6 +107,10 @@ export class RealtimeDialog {
   userText = ''
   private readonly audioChannel = new Channel<Buffer>()
   private endOfUtterance: ((text: string) => void) | null = null
+  /** Промежуточный текст для станции: без него через ~5 с она решает, что речи нет */
+  private partial: ((text: string) => void) | null = null
+  private partialText = ''
+  private readonly createdAt = Date.now()
   private eouSent = false
   private firstAudioLogged = false
   /** Звук ответа до проверки расшифровки: если фраза — одно слово вызова, ответ отменяем */
@@ -230,6 +234,19 @@ export class RealtimeDialog {
     this.endOfUtterance = callback
   }
 
+  onPartial (callback: (text: string) => void): void {
+    this.partial = callback
+  }
+
+  /** Сессия открыта и инструменты загружены — можно отдавать станции */
+  get warm (): boolean {
+    return this.ws.readyState === this.ws.OPEN && this.toolsReady
+  }
+
+  get ageMs (): number {
+    return Date.now() - this.createdAt
+  }
+
   private requestResponse (): void {
     if (this.responseActive) {
       this.createQueued = true
@@ -302,8 +319,16 @@ export class RealtimeDialog {
         }, 2000)
         break
       }
+      case 'conversation.item.input_audio_transcription.delta': {
+        this.partialText += String(event['delta'] ?? '')
+        if (this.partialText.trim()) this.partial?.(this.partialText.trim())
+        break
+      }
       case 'conversation.item.input_audio_transcription.completed': {
         const text = String(event['transcript'] ?? '').trim()
+        this.partialText = ''
+        // Станция ждёт, пока её «слышат»: даже одно «Яндекс» показываем ей как промежуточный текст
+        if (text) this.partial?.(text)
         this.logger.info(`Realtime user: ${text}`)
         this.onEvent?.({ text, type: 'user' })
         if (this.verdict !== 'pending') break
@@ -432,6 +457,7 @@ class RealtimeSTTSession extends STTBackendSession {
     super()
     this.opus = new OpusProcessor(pcm => dialog.appendPcm16k(pcm), async () => {})
     dialog.onEndOfUtterance(text => this.chunkTranscribed({ endOfUtt: true, text }))
+    dialog.onPartial(text => this.chunkTranscribed({ endOfUtt: false, text }))
   }
 
   close (): void {
@@ -449,7 +475,44 @@ class RealtimeSTTSession extends STTBackendSession {
 export type RealtimeBackendSettings = Omit<RealtimeSettings, 'instructions'> & { instructionsPath: string }
 
 export class RealtimeSTTBackend implements STTBackend {
+  /** Заранее открытая сессия с загруженными инструментами: на «Яндекс» не ждём MCP */
+  private warmDialog: RealtimeDialog | null = null
+  private readonly logger = getLogger<RealtimeSTTBackend>()
+
   constructor (private readonly settings: RealtimeBackendSettings) {}
+
+  /** Держать одну тёплую сессию; пересоздавать раз в 10 минут, чтобы не протухла */
+  startWarmPool (): void {
+    this.prewarm()
+    setInterval(() => {
+      if (this.warmDialog && this.warmDialog.ageMs > 10 * 60 * 1000) {
+        this.warmDialog.close()
+        this.warmDialog = null
+        this.prewarm()
+      }
+    }, 60 * 1000)
+  }
+
+  private prewarm (): void {
+    if (this.warmDialog) return
+    try {
+      this.warmDialog = this.createDialog()
+    } catch (error) {
+      this.logger.warn(`Realtime prewarm failed: ${error}`)
+    }
+  }
+
+  private takeWarm (): RealtimeDialog {
+    const dialog = this.warmDialog
+    this.warmDialog = null
+    setTimeout(() => this.prewarm(), 0)
+    if (dialog && dialog.warm) {
+      this.logger.info('Realtime: using prewarmed session')
+      return dialog
+    }
+    dialog?.close()
+    return this.createDialog()
+  }
 
   /** Новый диалог; инструкции перечитываются каждый раз — правки файла применяются без перезапуска */
   createDialog (overrides: Partial<RealtimeSettings> = {}): RealtimeDialog {
@@ -460,7 +523,7 @@ export class RealtimeSTTBackend implements STTBackend {
   async startTranscribing (_span?: Span): Promise<STTBackendSession> {
     // Новый вопрос (в том числе «Яндекс» посреди ответа) обрывает звучащий ответ
     RealtimeDialog.active?.close()
-    const dialog = this.createDialog()
+    const dialog = this.warmDialog !== undefined ? this.takeWarm() : this.createDialog()
     RealtimeDialog.active = dialog
     return new RealtimeSTTSession(dialog)
   }
