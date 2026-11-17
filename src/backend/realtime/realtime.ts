@@ -139,6 +139,9 @@ export class RealtimeDialog {
   private tokenTimer: NodeJS.Timeout | null = null
   /** Свежий токен MCP в сессию: при выдаче тёплой сессии станции и раз в 2 минуты */
   refreshTools: () => Promise<void> = async () => {}
+  /** Полная конфигурация сессии: при обновлении токена отправляем её целиком */
+  private session: Record<string, unknown> = {}
+  toolsRefreshedAt = Date.now()
   private audioBytes = 0
   /** Ответ создаём сами: только когда OpenAI уже получил список инструментов MCP */
   private toolsReady = true
@@ -161,13 +164,17 @@ export class RealtimeDialog {
           this.refreshTools = async () => {
             const fresh = await this.mcpTools(settings)
             if (fresh.length > 0 && this.ws.readyState === this.ws.OPEN) {
-              this.send({ session: { tools: fresh, type: 'realtime' }, type: 'session.update' })
+              // OpenAI заново загрузит инструменты MCP: до mcp_list_tools.completed ответ ждёт
+              this.toolsReady = false
+              this.toolsRefreshedAt = Date.now()
+              // Только tools в session.update сбрасывает остальное (инструкции, язык, аудио) — шлём сессию целиком
+              this.session = { ...this.session, tools: fresh }
+              this.send({ session: this.session, type: 'session.update' })
             }
           }
           this.tokenTimer = setInterval(() => void this.refreshTools(), 2 * 60 * 1000)
         }
-        this.send({
-          session: {
+        this.session = {
             audio: {
               input: {
                 format: { rate: 24_000, type: 'audio/pcm' },
@@ -185,9 +192,8 @@ export class RealtimeDialog {
             output_modalities: ['audio'],
             tools,
             type: 'realtime'
-          },
-          type: 'session.update'
-        })
+          }
+        this.send({ session: this.session, type: 'session.update' })
         resolve()
       })
       this.ws.once('error', reject)
@@ -546,7 +552,8 @@ export class RealtimeSTTBackend implements STTBackend {
     setTimeout(() => this.prewarm(), 0)
     if (dialog && dialog.warm) {
       this.logger.info('Realtime: using prewarmed session')
-      void dialog.refreshTools()
+      // Токен берётся с запасом 150 с: обновляем, только если он старше 90 с (иначе лишнее ожидание)
+      if (Date.now() - dialog.toolsRefreshedAt > 90 * 1000) void dialog.refreshTools()
       return dialog
     }
     dialog?.close()
