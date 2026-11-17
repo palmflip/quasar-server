@@ -90,10 +90,19 @@ function upsample16to24 (input: Buffer): Buffer {
   return output
 }
 
+/** «Яндекс, забудь» — сбросить память станции */
+const FORGET = /^\s*(яндекс[\s,]*)?(забудь|сбрось|начн(и|ём|ем) (заново|сначала)|новый разговор)/i
+
 /** Фраза из одного слова вызова: человек сказал «Яндекс» и сделал паузу перед вопросом */
 const WAKE_WORD_ONLY = /^\s*((яндекс|алиса)[\s.,!?…-]*)?$/i // пустая фраза (шум, эхо) — тоже не вопрос
 
 export type RealtimeEvent = { type: string } & Record<string, unknown>
+
+export interface RealtimeTurn {
+  assistant: string
+  at: number
+  user: string
+}
 
 export class RealtimeDialog {
   /** Диалог, чей ответ сейчас звучит на станции: новый вопрос его обрывает */
@@ -101,6 +110,8 @@ export class RealtimeDialog {
   private static pending: RealtimeDialog | null = null
   /** Наблюдатель за ходом диалога (демо-страница) */
   onEvent: ((event: RealtimeEvent) => void) | null = null
+  /** Законченная реплика (вопрос + ответ) — для памяти между диалогами станции */
+  onTurn: ((user: string, assistant: string) => void) | null = null
   assistantText = ''
   /** Ответ уже идёт: при закрытии распознавания соединение не рвём */
   responding = false
@@ -223,6 +234,19 @@ export class RealtimeDialog {
     this.send({ audio: upsample16to24(pcm).toString('base64'), type: 'input_audio_buffer.append' })
   }
 
+  /** Прошлые реплики в начало разговора: модель понимает «а про них подробнее», «а послезавтра?» */
+  async addHistory (turns: RealtimeTurn[]): Promise<void> {
+    if (turns.length === 0) return
+    await this.ready
+    for (const turn of turns) {
+      if (turn.user) {
+        this.send({ item: { content: [{ text: turn.user, type: 'input_text' }], role: 'user', type: 'message' }, type: 'conversation.item.create' })
+      }
+      this.send({ item: { content: [{ text: turn.assistant, type: 'output_text' }], role: 'assistant', type: 'message' }, type: 'conversation.item.create' })
+    }
+    this.logger.info(`Realtime: restored ${turns.length} previous turns`)
+  }
+
   /** PCM16 24 кГц ответа по мере генерации */
   audio (): AsyncIterable<Buffer> {
     return this.audioChannel
@@ -284,6 +308,7 @@ export class RealtimeDialog {
     if (this.responseDone) {
       this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
       this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, text: this.assistantText, type: 'assistant' })
+      if (this.assistantText.trim()) this.onTurn?.(this.userText, this.assistantText)
       this.audioChannel.close()
     }
   }
@@ -404,6 +429,7 @@ export class RealtimeDialog {
         }
         this.logger.info(`Realtime assistant: ${this.assistantText} (${Date.now() - this.speechStoppedAt} ms)`)
         this.onEvent?.({ ms: Date.now() - this.speechStoppedAt, text: this.assistantText, type: 'assistant' })
+        if (this.assistantText.trim()) this.onTurn?.(this.userText, this.assistantText)
         if (this.continuous) {
           this.verdict = 'idle'
           break
@@ -488,6 +514,8 @@ export class RealtimeSTTBackend implements STTBackend {
   /** Заранее открытая сессия с загруженными инструментами: на «Яндекс» не ждём MCP */
   private warmDialog: RealtimeDialog | null = null
   private readonly logger = getLogger<RealtimeSTTBackend>()
+  /** Память станции: последние реплики за 10 минут; «Яндекс, забудь» — сброс */
+  private history: RealtimeTurn[] = []
 
   constructor (private readonly settings: RealtimeBackendSettings) {}
 
@@ -535,6 +563,16 @@ export class RealtimeSTTBackend implements STTBackend {
     // Новый вопрос (в том числе «Яндекс» посреди ответа) обрывает звучащий ответ
     RealtimeDialog.active?.close()
     const dialog = this.warmDialog !== undefined ? this.takeWarm() : this.createDialog()
+    const now = Date.now()
+    this.history = this.history.filter(turn => now - turn.at < 10 * 60 * 1000).slice(-6)
+    void dialog.addHistory(this.history)
+    dialog.onTurn = (user, assistant) => {
+      if (FORGET.test(user)) {
+        this.history = []
+        return
+      }
+      this.history.push({ assistant, at: Date.now(), user })
+    }
     RealtimeDialog.active = dialog
     return new RealtimeSTTSession(dialog)
   }
