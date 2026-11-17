@@ -189,12 +189,12 @@ export class RealtimeDialog {
   private async mcpTools (settings: RealtimeSettings): Promise<object[]> {
     if (!settings.mcpTokenUrl) return []
     try {
-      const url = new URL(settings.mcpTokenUrl)
-      url.searchParams.set('min_valid', '150')
-      const response = await fetch(url)
+      const tokenUrl = new URL(settings.mcpTokenUrl)
+      tokenUrl.searchParams.set('min_valid', '150')
+      const response = await fetch(tokenUrl)
       const { access_token: token, url } = await response.json() as { access_token: string | null, url: string }
       if (!token) return []
-      const label = url.pathname.split('/').pop() ?? 'mcp'
+      const label = tokenUrl.pathname.split('/').pop() ?? 'mcp'
       return [{
         authorization: token,
         require_approval: 'never',
