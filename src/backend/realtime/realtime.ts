@@ -126,6 +126,9 @@ export class RealtimeDialog {
 
   private readonly continuous: boolean
   private tokenTimer: NodeJS.Timeout | null = null
+  /** Свежий токен MCP в сессию: при выдаче тёплой сессии станции и раз в 2 минуты */
+  refreshTools: () => Promise<void> = async () => {}
+  private audioBytes = 0
   /** Ответ создаём сами: только когда OpenAI уже получил список инструментов MCP */
   private toolsReady = true
   private createWhenReady = false
@@ -144,12 +147,13 @@ export class RealtimeDialog {
         this.toolsReady = tools.length === 0
         if (tools.length > 0) {
           // access-токен живёт 5 минут: в долгом разговоре обновляем инструменты с новым токеном
-          this.tokenTimer = setInterval(async () => {
+          this.refreshTools = async () => {
             const fresh = await this.mcpTools(settings)
             if (fresh.length > 0 && this.ws.readyState === this.ws.OPEN) {
               this.send({ session: { tools: fresh, type: 'realtime' }, type: 'session.update' })
             }
-          }, 4 * 60 * 1000)
+          }
+          this.tokenTimer = setInterval(() => void this.refreshTools(), 2 * 60 * 1000)
         }
         this.send({
           session: {
@@ -185,10 +189,12 @@ export class RealtimeDialog {
   private async mcpTools (settings: RealtimeSettings): Promise<object[]> {
     if (!settings.mcpTokenUrl) return []
     try {
-      const response = await fetch(settings.mcpTokenUrl)
+      const url = new URL(settings.mcpTokenUrl)
+      url.searchParams.set('min_valid', '150')
+      const response = await fetch(url)
       const { access_token: token, url } = await response.json() as { access_token: string | null, url: string }
       if (!token) return []
-      const label = new URL(settings.mcpTokenUrl).pathname.split('/').pop() ?? 'mcp'
+      const label = url.pathname.split('/').pop() ?? 'mcp'
       return [{
         authorization: token,
         require_approval: 'never',
@@ -213,6 +219,7 @@ export class RealtimeDialog {
   async appendPcm16k (pcm: Buffer): Promise<void> {
     await this.ready
     if (this.ws.readyState !== this.ws.OPEN) return
+    this.audioBytes += pcm.length
     this.send({ audio: upsample16to24(pcm).toString('base64'), type: 'input_audio_buffer.append' })
   }
 
@@ -293,6 +300,9 @@ export class RealtimeDialog {
     }
     switch (event['type']) {
       case 'input_audio_buffer.speech_started': {
+        this.logger.info(`Realtime speech started (${this.audioBytes} bytes of audio so far)`)
+        // Станция сдаётся через ~5 с без промежуточного результата: сообщаем, что речь слышна
+        if (!this.continuous && !this.partialText) this.partial?.('…')
         if (this.continuous) {
           // Человек заговорил: сервер сам отменяет ответ (interrupt_response), клиент глушит звук
           this.onEvent?.({ type: 'speech-started' })
@@ -508,6 +518,7 @@ export class RealtimeSTTBackend implements STTBackend {
     setTimeout(() => this.prewarm(), 0)
     if (dialog && dialog.warm) {
       this.logger.info('Realtime: using prewarmed session')
+      void dialog.refreshTools()
       return dialog
     }
     dialog?.close()
